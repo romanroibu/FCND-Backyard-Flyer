@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-import time
 import logger
 import connection
 import os
+import frame_utils
 from pymavlink import mavutil
 
 class Drone:
@@ -20,6 +20,8 @@ class Drone:
         self.mode = None
         self.connected = False
         
+        self.in_mission = False
+        
         #TODO: Change the log name
         logname = "navLog.txt"
         self.log = logger.Logger(os.path.join("Logs",logname))
@@ -27,79 +29,151 @@ class Drone:
 		
     #Provided
     def connect(self, device):
-        self.connection = connection.Connection(device, self.decode_mav_msg)
-        while self.connected != True:
-            time.sleep(1)
+        self.connection = connection.Connection(device, self.decode_gps_msg)
+        self.connection.subscribe('HEARTBEAT',self.heartbeat_callback)        
     
     #Provided
     def disconnect(self):
         self.connection.disconnect()
         self.log.close()
+        
+    
+    def calculate_box(self, home):
+        
+        return
 
     
+
+    
+    def heartbeat_callback(self, msg):
+        self.connected = True
+        self.motors_armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
+        self.guided = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED) != 0
+    
+    
+    # Methods for the arming state
     #Sets the mode to guided, arms the vehicle (with checks) and save the home position as the position it is armed
     def arm_vehicle(self):
         #TODO: fill out this method
-        return True
+        
+        self.connection.subscribe('GLOBAL_POSITION_INT',self.arming_callback)
+        return   
 
-    #Command the vehicle to a specific height and return True when it gets to the specified altitude
+    
+    def arming_callback(self, msg):        
+        # Trigger next state
+        if self.motors_armed & self.guided:
+            # Save the current position as global_position
+            self.global_home[0] = float(msg.lon)/(10**7)
+            self.global_home[1] = float(msg.lat)/(10**7)
+            self.global_home[2] = float(msg.relative_alt)/1000
+            self.unsubscribe('GLOBAL_POSITION_INT',self.arming_callback)
+            self.takeoff()
+        
+    
+    #Methods for the takeoff state
+    #Command the vehicle to a specific height and trigger next state when the drone reaches the specified altitude
     def takeoff(self):
         # TODO: fill out this method
+        
+        self.subscribe('GLOBAL_POSITION_INT',self.takeoff_callback)
         return True
-
-    # Command the vehicle to the target position, assign the target to self.target_position and return True when it has arrived
+    
+    def takeoff_callback(self, msg): 
+        
+        # Trigger next state
+        if msg.relative_alt/1000 > 0.95*self.target_position[2]:
+            self.unsubscribe('GLOBAL_POSITION_INT',self.takeoff_callback)
+            self.all_waypoints = self.calculate_box(self.global_home)
+            self.target_position = self.all_waypoints.pop()
+            self.goto(self.target_position)
+    
+    #Methods for the Goto state
+    # Command the vehicle to the target position, assign the target to self.target_position and trigger next state when the position is reached (within 1 m)
     def goto(self, target):
         #TODO: fill out this method
-        return True
-
-    # Lands the vehicle in the current location and returns true when the vehicle is on the ground
+        
+        self.subscribe('GLOBAL_POSITION_INT',self.goto_callback)
+        return
+    
+    def goto_callback(self, msg):
+        global_position = np.array((float(msg.lon)/(10**7),float(msg.lat)/(10**7),float(msg.relative_alt)/1000))
+        local_position = frame_utils.global_to_local(global_position,self.global_home)
+        
+        # Trigger next state
+        if(np.linalg.norm(local_position-self.target_position)<1.0):
+            self.unsubscribe('GLOBAL_POSITION_INT',self.goto_callback)
+            if len(self.all_waypoints>0):
+                self.target_position = self.all_waypoints.pop()
+                self.goto(self.target_positions)                
+            else:
+                self.land()
+                
+    
+    # Methods for the landing state
+    # Lands the vehicle in the current location and triggers disarming when the vehicle is on the ground
     def land(self):
         #TODO: fill out this method
-        return True
         
+        self.subscribe('GLOBAL_POSITION_INT',self.land_callback)
+        return True
+
+    def land_callback(self, msg):
+        
+        # Trigger next state
+        if(np.abs(float(msg.relative_alt)/1000-self.target_position[2])<0.05 &
+           float(msg.vz)<0.01):
+            self.unsubscribe('GLOBAL_POSITION_INT',self.land_callback)
+            self.disarm()
+            
+    
+    #Disarming method callback
     #Disarms the vehicle, returns control to manual, and returns true when the motors report armed
     def disarm_vehicle(self):
-        #TODO: fill out this method   
-        return True
-
-    #This method is provided
-    def decode_mav_msg(self, name, msg):
-        # NOTE: this effectively becomes a callback of the main connection thread
-        #This will be implemented for the students and sort the mavlink message to different callbacks for different types
-        #It may actually just populate the vehicle class data directly
+        #TODO: fill out this method
         
-        if name is 'STATUSTEXT':
-            name #Do nothing
-
-        elif name is 'HEARTBEAT':
-            #print('Heartbeat Message')
-            self.connected = True
-            self.motors_armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
-            # Correctly parse the state information
-        elif name is 'GLOBAL_POSITION_INT':
+        self.subscribe('HEARTBEAT',self.disarm_callback)
+        return
+    
+    def disarm_callback(self, msg):
+        self.motors_armed = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) != 0
+        self.guided = (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED) != 0
+        
+        if ~self.motors_armed & ~self.guided:
+            self.in_mission = False
             
-            self.global_position[0] = float(msg.lon) / (10 ** 7)
-            data = [self.global_position[0]]
-            self.global_position[1] = float(msg.lat) / (10 ** 7)
-            data.append(self.global_position[1])
-            self.global_position[2] = float(msg.relative_alt) / 1000
-            data.append(self.global_position[2])
-            self.global_velocity[0] = float(msg.vx) / 100
-            data.append(self.global_velocity[0])
-            self.global_velocity[1] = float(msg.vy) / 100
-            data.append(self.global_velocity[1])
-            self.global_velocity[2] = -float(msg.vz) / 100
-            data.append(self.global_velocity[2])
-            self.heading = float(msg.hdg) / 100
-            data.append(self.heading)
+    
+        
             
-            for i in range(3):
-                data.append(self.target_position[i])
+    def init(self):
+        if ~self.connected:
+            print("Vehicle Not Connected")
+        
+        while True:
+            if self.connected:
+                print('Vehicle Connected')
+                break
+        
+        # Set first state
+        self.arm()
+        
             
-            self.log.log_data(data)
             
-        else:
-            print(name)
+    def mainloop(self):
+        
+        self.init()       
+        
+        while True:
+            if(~self.in_mission):
+                break
+            
+        self.shutdown()
+            
+        
+            
+                
+            
+            
 
 
 

@@ -3,6 +3,7 @@
 from pymavlink import mavutil
 import threading
 import os
+from curio import Queue
 # force use of mavlink v2.0
 os.environ['MAVLINK20'] = '1'
 
@@ -18,6 +19,12 @@ class Connection:
 
         self.target_system = 0
         self.target_component = 0
+        
+        self.msg_types = ['HEARTBEAT','GLOBAL_POSITION_INT']
+        self.callbacks = {}
+        for m_types in self.msg_types:
+            self.callbacks[m_types] = set()
+        
 
 
     def read_thread(self):
@@ -28,10 +35,10 @@ class Connection:
             # NOTE: this is a blocking call, which is why we have a thread for it
             msg = self.master.recv_match(blocking=True)
             
-
+            
             # if it's a good message, send it back to the callback
-            if msg.get_type() != 'BAD_DATA':
-                self.callback(msg.get_type(), msg)
+            #if msg.get_type() != 'BAD_DATA':
+            #    self.callback(msg.get_type(), msg)
 
             # want to send a heartbeat periodically, so can just do that when we receive one
             if msg.get_type() == 'HEARTBEAT':
@@ -40,8 +47,26 @@ class Connection:
                 self.master.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
                                                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
                                                0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
+            
+            if msg.get_type() in self.callbacks.keys():
+                for cb in self.callbacks[msg.get_type()]:
+                    cb(msg)
+                    
 
         print("read ended")
+    
+    def subscribe(self, m_type, callback):
+        if m_type in self.msg_types:
+            self.callbacks[m_type].add(callback)
+        else:
+            print("Invalid Mavlink type")
+    
+    def unsubscribe(self, m_type, callback):
+        if m_type in self.msg_types:
+            self.callbacks[m_type].remove(callback)
+        else:
+            print("Invalid Mavlink type")
+        
 
 
     def send_mav_command(self, command_type, param1, param2, param3, param4, x,
